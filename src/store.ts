@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { IssueTruncation, SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { validateSharedManifest } from "./sharedValidation.ts";
+import { sealManifest, verifyEnvelope, type IntegrityEnvelope } from "./protection.ts";
 import { log } from "./log.ts";
 
 /**
@@ -15,16 +16,25 @@ import { log } from "./log.ts";
  * Files are named by SHA-256(batchId) so storage paths contain no client
  * supplied identifier text, and writes are atomic (temp file + rename).
  *
+ * Each file is a sealed integrity envelope (see protection.ts): the shared
+ * document plus an HMAC tag over its full contents, keyed by the stable
+ * deployment secret. The business contentHash binds the (unrecoverable)
+ * original request, so without the seal a storage-layer rewrite of a
+ * still-legal value — a measurement scalar, an alias, a timestamp that keeps
+ * its format — would be indistinguishable from the first accepted result and
+ * would even replay as an idempotent retry.
+ *
  * Recovery is fail-closed: a data volume may have been restored from a
  * backup, migrated from an older version or logically corrupted, so every
- * persisted entry is re-validated against the full current shared-manifest
+ * persisted entry is (1) re-validated against the full current shared-manifest
  * contract (structure, alias/hash/timestamp formats, scalar measurements,
- * record-alias uniqueness, reference closure and the file-name <-> batchId
- * binding) before it is trusted. Any corrupt entry is reported via
- * diagnostics that contain only the hashed file name, rule codes and JSON
- * paths — never file contents — and aborts startup. A corrupt entry is
- * therefore never served by GET and never treated as absent, so a batchId
- * with a corrupt entry cannot be silently overwritten either.
+ * record-alias uniqueness, reference closure), (2) checked against the
+ * file-name <-> batchId binding, and (3) cryptographically sealed, before it
+ * is trusted. Any corrupt or tampered entry is reported via diagnostics that
+ * contain only the hashed file name, rule codes and JSON paths — never file
+ * contents — and aborts startup. It is therefore never served by GET, never
+ * participates in idempotent replay, and is never treated as absent, so a
+ * batchId with a corrupt entry cannot be silently overwritten either.
  */
 
 export type CreateOutcome =
@@ -55,9 +65,12 @@ export class ManifestStore {
   private readonly locks = new Map<string, Promise<unknown>>();
 
   private readonly dataDir: string;
+  /** Deployment secret used both for aliases and for persistence seals. */
+  private readonly secret: Buffer;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, secret: Buffer) {
     this.dataDir = dataDir;
+    this.secret = secret;
     mkdirSync(dataDir, { recursive: true });
   }
 
@@ -106,10 +119,10 @@ export class ManifestStore {
   }
 
   /**
-   * Validate one persisted entry. Returns the list of contract violations
-   * (empty when the entry is trustworthy) and, when the issue cap was hit, a
-   * truncation summary; only fully valid entries are admitted into the
-   * in-memory index.
+   * Validate and seal-check one persisted entry. Returns the list of contract
+   * violations (empty when the entry is trustworthy) and, when the issue cap
+   * was hit, a truncation summary; only fully valid, intact entries are
+   * admitted into the in-memory index.
    */
   private async inspectEntry(entry: string): Promise<{
     issues: ValidationIssue[];
@@ -134,9 +147,20 @@ export class ManifestStore {
       return readIssue("invalid_json", "$", "persisted manifest is not valid JSON");
     }
 
+    // The on-disk unit is an integrity envelope, not a bare shared manifest.
+    const envelopeResult = this.parseEnvelope(parsed);
+    if (envelopeResult === null) {
+      return readIssue(
+        "invalid_integrity_envelope",
+        "$",
+        "persisted entry is not a sealed integrity envelope",
+      );
+    }
+    const envelope = envelopeResult;
+
     let manifest: SharedManifest;
     try {
-      manifest = validateSharedManifest(parsed);
+      manifest = validateSharedManifest(envelope.manifest);
     } catch (err) {
       if (err instanceof CorruptManifestError) {
         return { issues: err.issues, truncation: err.truncation };
@@ -145,7 +169,7 @@ export class ManifestStore {
     }
 
     // The storage key is part of the contract: the file name must be the
-    // SHA-256 of the batchId it claims to hold.
+    // SHA-256 of the batchId the sealed document claims to hold.
     if (entry !== this.fileName(manifest.batchId)) {
       return readIssue(
         "batch_id_file_mismatch",
@@ -154,8 +178,40 @@ export class ManifestStore {
       );
     }
 
+    // Cryptographic integrity last: a document that rewrites any protected
+    // field while keeping every format legal fails here, and a valid tag
+    // cannot be produced without the deployment secret.
+    if (!verifyEnvelope(envelope, this.secret)) {
+      return readIssue(
+        "integrity_seal_mismatch",
+        "$.protection.seal",
+        "persisted manifest failed integrity verification",
+      );
+    }
+
+    // Only the sealed inner document is admitted; envelope metadata never
+    // reaches the in-memory index or any API response.
     this.manifests.set(manifest.batchId, manifest);
     return { issues: [], truncation: null };
+  }
+
+  /**
+   * Shape-check the persistence envelope. Returns null for anything that is
+   * not a structurally recognizable current-version envelope; the inner
+   * manifest itself is contract-validated separately.
+   */
+  private parseEnvelope(raw: unknown): IntegrityEnvelope | null {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const candidate = raw as Record<string, unknown>;
+    if (candidate.v !== 1) return null;
+    if (candidate.manifest === null || typeof candidate.manifest !== "object") return null;
+    const protection = candidate.protection;
+    if (protection === null || typeof protection !== "object" || Array.isArray(protection)) {
+      return null;
+    }
+    const meta = protection as Record<string, unknown>;
+    if (typeof meta.seal !== "string" || typeof meta.sealAlgo !== "string") return null;
+    return candidate as unknown as IntegrityEnvelope;
   }
 
   get(batchId: string): SharedManifest | undefined {
@@ -192,7 +248,7 @@ export class ManifestStore {
 
     const target = join(this.dataDir, this.fileName(batchId));
     const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tmp, JSON.stringify(manifest), { mode: 0o600 });
+    await writeFile(tmp, JSON.stringify(sealManifest(manifest, this.secret)), { mode: 0o600 });
     await rename(tmp, target);
     this.manifests.set(batchId, manifest);
     return { status: "created", manifest };

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Aliaser } from "../src/alias.ts";
@@ -10,9 +10,11 @@ import { contentHash } from "../src/canonical.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
+import { sealManifest } from "../src/protection.ts";
 import { transformBatch } from "../src/transform.ts";
 import { CorruptManifestError } from "../src/types.ts";
 import { validateBatch } from "../src/validation.ts";
+import type { SharedManifest } from "../src/types.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
 
@@ -67,21 +69,122 @@ async function writeEntry(dir: string, fileName: string, value: unknown): Promis
   await writeFile(join(dir, fileName), typeof value === "string" ? value : JSON.stringify(value));
 }
 
+/** Serialize a document as a current-version sealed persistence envelope. */
+function sealedDoc(doc: SharedManifest): string {
+  return JSON.stringify(sealManifest(doc, SECRET));
+}
+
 test("recovery: a valid persisted manifest survives a restart", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-ok-"));
   const batch = validateBatch(validBody("batch-restore-ok"));
   const hash = contentHash(batch);
   const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
 
-  const first = new ManifestStore(dir);
+  const first = new ManifestStore(dir, SECRET);
   assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, SECRET);
   await restarted.load();
   assert.deepEqual(restarted.get("batch-restore-ok"), manifest);
   // Idempotency/conflict semantics are intact over restored entries.
   assert.equal((await restarted.create(batch.batchId, hash, manifest)).status, "replayed");
   assert.equal((await restarted.create(batch.batchId, "different-hash", manifest)).status, "conflict");
+});
+
+test("recovery: a legal-shaped protected-field rewrite breaks the integrity seal", async () => {
+  // The integrity-case scenario: a service-created manifest is tampered at
+  // the persistence layer. Only a still-legal measurement scalar changes
+  // (benign -> malignant); batchId, file name, alias formats, createdAt and
+  // the ORIGINAL contentHash are left exactly as accepted.
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-tamper-"));
+  const batch = validateBatch({
+    batchId: "integrity-case",
+    records: [
+      {
+        recordId: "R1",
+        patientId: "P1",
+        accessionId: "A1",
+        relatedIds: [],
+        measurements: { diagnosis: "benign" },
+      },
+    ],
+  });
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+
+  const first = new ManifestStore(dir, SECRET);
+  assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
+
+  // Storage-layer modification: rewrite the diagnosis in the sealed file
+  // without touching anything else (the seal tag is left stale on purpose).
+  const fileName = fileNameFor("integrity-case");
+  const onDisk = JSON.parse(await readFile(join(dir, fileName), "utf8"));
+  const doc: SharedManifest = onDisk.manifest;
+  assert.equal(doc.records[0].measurements.diagnosis, "benign");
+  doc.records[0].measurements.diagnosis = "malignant";
+  await writeEntry(dir, fileName, onDisk);
+
+  const restarted = new ManifestStore(dir, SECRET);
+  await assert.rejects(restarted.load(), CorruptStoreError);
+  // The tampered entry is neither queryable nor eligible for idempotent replay.
+  assert.equal(restarted.get("integrity-case"), undefined);
+
+  // The stale document still carries the ORIGINAL contentHash (what a retry
+  // compares against): the cryptographic seal is what stops the rewrite from
+  // being served as a 200 replay. Fail-closed startup means no response at all
+  // is produced rather than the rewritten manifest.
+  const persisted = JSON.parse(await readFile(join(dir, fileName), "utf8"))
+    .manifest as SharedManifest;
+  assert.equal(persisted.contentHash, hash);
+  assert.equal(persisted.records[0].measurements.diagnosis, "malignant");
+});
+
+test("recovery: integrity metadata never appears in shared documents", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-seal-"));
+  const batch = validateBatch(validBody("batch-metadata-shape"));
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const store = new ManifestStore(dir, SECRET);
+  assert.equal((await store.create(batch.batchId, hash, manifest)).status, "created");
+
+  // The on-disk file carries the envelope...
+  const onDisk = JSON.parse(await readFile(join(dir, fileNameFor(batch.batchId)), "utf8"));
+  assert.equal(onDisk.v, 1);
+  assert.equal(typeof onDisk.protection.seal, "string");
+  assert.equal(onDisk.protection.sealAlgo, "shared-manifest-seal-v1");
+
+  // ...but neither the in-memory/indexed document nor anything a caller can
+  // observe exposes seal metadata.
+  const served = store.get(batch.batchId);
+  assert.deepEqual(served, manifest);
+  assert.deepEqual(Object.keys(served as object).sort(), ["batchId", "contentHash", "createdAt", "records"]);
+  assert.ok(!JSON.stringify(served).includes("protection"), "no integrity metadata in the served document");
+});
+
+test("recovery: a manifest sealed by a different deployment secret is rejected", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-secret-"));
+  const otherSecret = Buffer.from("fedcba9876543210fedcba9876543210", "utf8");
+  const batch = validateBatch(validBody("batch-other-secret"));
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(otherSecret), hash);
+  // Sealed under the OTHER deployment's key, loaded with this one's.
+  await writeEntry(dir, fileNameFor("batch-other-secret"), JSON.stringify(sealManifest(manifest, otherSecret)));
+
+  const store = new ManifestStore(dir, SECRET);
+  await assert.rejects(store.load(), CorruptStoreError);
+  assert.equal(store.get("batch-other-secret"), undefined);
+});
+
+test("recovery: a bare (unenveloped) persisted document is rejected", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-bare-"));
+  const batch = validateBatch(validBody("batch-bare"));
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  await writeEntry(dir, fileNameFor("batch-bare"), manifest);
+
+  const store = new ManifestStore(dir, SECRET);
+  await assert.rejects(store.load(), CorruptStoreError);
+  assert.equal(store.get("batch-bare"), undefined);
 });
 
 test("recovery: the corrupt restore-batch sample aborts startup and is never served", async () => {
@@ -90,12 +193,15 @@ test("recovery: the corrupt restore-batch sample aborts startup and is never ser
   // A fully valid entry sits next to the corrupt one.
   const batch = validateBatch(validBody("batch-healthy"));
   const hash = contentHash(batch);
-  const first = new ManifestStore(dir);
+  const first = new ManifestStore(dir, SECRET);
   await first.create(batch.batchId, hash, transformBatch(batch, new Aliaser(SECRET), hash));
 
-  await writeEntry(dir, fileNameFor("restore-batch"), CORRUPT_SAMPLE);
+  // The corrupt document is sealed as if it were a real on-disk entry: the
+  // contract violations (raw identifiers, malformed hash/timestamp) must be
+  // detected even though the integrity envelope itself is well formed.
+  await writeEntry(dir, fileNameFor("restore-batch"), sealedDoc(CORRUPT_SAMPLE as unknown as SharedManifest));
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, SECRET);
   let failure: unknown;
   try {
     await restarted.load();
@@ -136,36 +242,44 @@ test("recovery: duplicate record aliases in a persisted entry are rejected", asy
     relatedAliases: [],
     measurements: {},
   };
-  await writeEntry(dir, fileNameFor("batch-dup-alias"), {
-    batchId: "batch-dup-alias",
-    createdAt: "2026-10-04T00:00:00.000Z",
-    contentHash: "0".repeat(64),
-    records: [record, { ...record }],
-  });
+  await writeEntry(
+    dir,
+    fileNameFor("batch-dup-alias"),
+    sealedDoc({
+      batchId: "batch-dup-alias",
+      createdAt: "2026-10-04T00:00:00.000Z",
+      contentHash: "0".repeat(64),
+      records: [record, { ...record }],
+    } as unknown as SharedManifest),
+  );
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dup-alias"), undefined);
 });
 
 test("recovery: unclosed references in a persisted entry are rejected", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-dangling-"));
-  await writeEntry(dir, fileNameFor("batch-dangling-alias"), {
-    batchId: "batch-dangling-alias",
-    createdAt: "2026-10-04T00:00:00.000Z",
-    contentHash: "0".repeat(64),
-    records: [
-      {
-        recordAlias: `rec-${"a".repeat(32)}`,
-        patientAlias: `pat-${"b".repeat(32)}`,
-        accessionAlias: `acc-${"c".repeat(32)}`,
-        relatedAliases: [`rec-${"d".repeat(32)}`],
-        measurements: {},
-      },
-    ],
-  });
+  await writeEntry(
+    dir,
+    fileNameFor("batch-dangling-alias"),
+    sealedDoc({
+      batchId: "batch-dangling-alias",
+      createdAt: "2026-10-04T00:00:00.000Z",
+      contentHash: "0".repeat(64),
+      records: [
+        {
+          recordAlias: `rec-${"a".repeat(32)}`,
+          patientAlias: `pat-${"b".repeat(32)}`,
+          accessionAlias: `acc-${"c".repeat(32)}`,
+          relatedAliases: [`rec-${"d".repeat(32)}`],
+          measurements: {},
+        },
+      ],
+    } as unknown as SharedManifest),
+  );
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dangling-alias"), undefined);
 });
@@ -175,10 +289,10 @@ test("recovery: file name must match the SHA-256 binding of its batchId", async 
   const batch = validateBatch(validBody("batch-binding"));
   const hash = contentHash(batch);
   const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
-  // Persist the valid document under the WRONG file name.
-  await writeEntry(dir, fileNameFor("some-other-batch"), manifest);
+  // Persist the sealed document under the WRONG file name.
+  await writeEntry(dir, fileNameFor("some-other-batch"), sealedDoc(manifest));
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-binding"), undefined);
 });
@@ -204,7 +318,7 @@ test("recovery: a restored entry with a thousand invalid values yields bounded d
       },
     ],
   };
-  await writeEntry(dir, fileNameFor("batch-many-bad"), entry);
+  await writeEntry(dir, fileNameFor("batch-many-bad"), sealedDoc(entry as unknown as SharedManifest));
 
   // The shared contract validator applies the same deterministic cap.
   let contractFailure: unknown;
@@ -232,7 +346,7 @@ test("recovery: a restored entry with a thousand invalid values yields bounded d
     captured.push(String(chunk));
     return true;
   };
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   let failure: unknown;
   try {
     await store.load();
@@ -261,7 +375,7 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-json-"));
   await writeEntry(dir, fileNameFor("batch-broken"), "{not valid json");
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
 });
 

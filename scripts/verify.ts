@@ -1,16 +1,18 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Aliaser } from "../src/alias.ts";
 import { contentHash } from "../src/canonical.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
+import { sealManifest } from "../src/protection.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptManifestError } from "../src/types.ts";
+import type { SharedManifest } from "../src/types.ts";
 import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 
 /**
@@ -300,9 +302,11 @@ async function runRecoverySmoke(): Promise<boolean> {
   const fileNameFor = (batchId: string): string =>
     createHash("sha256").update(batchId, "utf8").digest("hex") + ".json";
   const secret = Buffer.from("verify-recovery-secret-0123456789ab", "utf8");
+  const sealedDoc = (doc: unknown): string =>
+    JSON.stringify(sealManifest(doc as SharedManifest, secret));
 
   const expectCorruptLoad = async (dir: string, batchId: string): Promise<Error> => {
-    const store = new ManifestStore(dir);
+    const store = new ManifestStore(dir, secret);
     try {
       await store.load();
     } catch (err) {
@@ -333,9 +337,9 @@ async function runRecoverySmoke(): Promise<boolean> {
     });
     const hash = contentHash(batch);
     const manifest = transformBatch(batch, new Aliaser(secret), hash);
-    const first = new ManifestStore(okDir);
+    const first = new ManifestStore(okDir, secret);
     assert((await first.create(batch.batchId, hash, manifest)).status === "created", "create failed");
-    const restored = new ManifestStore(okDir);
+    const restored = new ManifestStore(okDir, secret);
     await restored.load();
     assert(
       JSON.stringify(restored.get(batch.batchId)) === JSON.stringify(manifest),
@@ -347,12 +351,13 @@ async function runRecoverySmoke(): Promise<boolean> {
       "replay/conflict semantics must hold over restored entries",
     );
 
-    // 2. The confirmed corrupt sample: hash-rule file name, valid JSON, but
-    // raw identifiers in the alias fields and malformed hash/timestamp.
+    // 2. The confirmed corrupt sample: hash-rule file name, valid JSON inside
+    // a well-formed integrity envelope, but raw identifiers in the alias
+    // fields and malformed hash/timestamp.
     const corruptDir = mkdtempSync(join(tmpdir(), "verify-recovery-corrupt-"));
     await writeFile(
       join(corruptDir, fileNameFor("restore-batch")),
-      JSON.stringify({
+      sealedDoc({
         batchId: "restore-batch",
         createdAt: "not-a-timestamp",
         contentHash: "not-a-valid-hash",
@@ -383,7 +388,7 @@ async function runRecoverySmoke(): Promise<boolean> {
     };
     await writeFile(
       join(dupDir, fileNameFor("verify-recovery-dup")),
-      JSON.stringify({
+      sealedDoc({
         batchId: "verify-recovery-dup",
         createdAt: "2026-10-04T00:00:00.000Z",
         contentHash: "0".repeat(64),
@@ -396,7 +401,7 @@ async function runRecoverySmoke(): Promise<boolean> {
     const danglingDir = mkdtempSync(join(tmpdir(), "verify-recovery-dangling-"));
     await writeFile(
       join(danglingDir, fileNameFor("verify-recovery-dangling")),
-      JSON.stringify({
+      sealedDoc({
         batchId: "verify-recovery-dangling",
         createdAt: "2026-10-04T00:00:00.000Z",
         contentHash: "0".repeat(64),
@@ -438,7 +443,7 @@ async function runRecoverySmoke(): Promise<boolean> {
 
     await writeFile(
       join(manyDir, fileNameFor("verify-recovery-many")),
-      JSON.stringify(manyEntry),
+      sealedDoc(manyEntry),
     );
     const captured: string[] = [];
     const originalStderrWrite = process.stderr.write.bind(process.stderr);
@@ -466,6 +471,65 @@ async function runRecoverySmoke(): Promise<boolean> {
       assert(!corruptLogLine.includes("RECOVERY-SECRET-VALUE"), "log must not echo corrupt values");
       assert(corruptLogLine.length < 64 * 1024, "recovery log line must be bounded");
     }
+
+    // 6. The integrity-case scenario: a service-created, correctly sealed
+    // entry is modified at the persistence layer by flipping one legal
+    // measurement scalar (diagnosis benign -> malignant) while leaving
+    // batchId, file name, alias formats, createdAt and the ORIGINAL
+    // contentHash untouched. Such an entry must fail recovery and never
+    // become queryable or eligible for idempotent replay.
+    const tamperDir = mkdtempSync(join(tmpdir(), "verify-recovery-tamper-"));
+    const tamperBatch = validateBatch({
+      batchId: "integrity-case",
+      records: [
+        {
+          recordId: "R1",
+          patientId: "P1",
+          accessionId: "A1",
+          relatedIds: [],
+          measurements: { diagnosis: "benign" },
+        },
+      ],
+    });
+    const tamperHash = contentHash(tamperBatch);
+    const tamperManifest = transformBatch(tamperBatch, new Aliaser(secret), tamperHash);
+    const tamperStore = new ManifestStore(tamperDir, secret);
+    assert(
+      (await tamperStore.create(tamperBatch.batchId, tamperHash, tamperManifest)).status === "created",
+      "integrity-case create failed",
+    );
+    const tamperFile = join(tamperDir, fileNameFor("integrity-case"));
+    const onDisk = JSON.parse(await readFile(tamperFile, "utf8"));
+    assert(onDisk.manifest.records[0].measurements.diagnosis === "benign", "fixture baseline");
+    // Persistence-layer rewrite: flip ONLY the protected business scalar and
+    // leave the stale seal in place.
+    onDisk.manifest.records[0].measurements.diagnosis = "malignant";
+    await writeFile(tamperFile, JSON.stringify(onDisk));
+
+    const tamperedLoad = new ManifestStore(tamperDir, secret);
+    let tamperFailure: unknown;
+    try {
+      await tamperedLoad.load();
+    } catch (err) {
+      tamperFailure = err;
+    }
+    assert(tamperFailure instanceof CorruptStoreError, "a legal-shaped rewrite must abort the load");
+    assert(
+      tamperedLoad.get("integrity-case") === undefined,
+      "the rewritten entry must not become queryable",
+    );
+    // Demonstrate why format checks alone failed: the tampered document still
+    // carries the ORIGINAL contentHash, which is exactly what a retry of the
+    // first request compares against. The seal is the only control that stops
+    // it from being served as a 200 idempotent replay.
+    const rewritten = JSON.parse(await readFile(tamperFile, "utf8")).manifest as SharedManifest;
+    assert(rewritten.records[0].measurements.diagnosis === "malignant", "fixture kept the rewrite");
+    assert(
+      rewritten.contentHash === tamperHash && rewritten.batchId === "integrity-case",
+      "the rewrite left contentHash and batchId untouched",
+    );
+    // The service fails closed (refuses startup), so no replay response can
+    // ever be produced; with no admitted entry, GET likewise returns nothing.
 
     process.stdout.write("--- verify: recovery safety OK\n");
     return true;

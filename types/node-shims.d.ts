@@ -25,6 +25,7 @@ declare module "node:crypto" {
   export function createHash(algorithm: string): Hash;
   export function randomBytes(length: number): Buffer;
   export function randomUUID(): string;
+  export function timingSafeEqual(a: Buffer, b: Buffer): boolean;
 }
 
 declare module "node:http" {
