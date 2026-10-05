@@ -23,6 +23,7 @@ declare module "node:crypto" {
   };
   export function createHmac(algorithm: string, key: unknown): Hmac;
   export function createHash(algorithm: string): Hash;
+  export function timingSafeEqual(a: Buffer, b: Buffer): boolean;
   export function randomBytes(length: number): Buffer;
   export function randomUUID(): string;
 }

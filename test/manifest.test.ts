@@ -70,7 +70,7 @@ test("aliases are stable across batches and isolated across identifier classes",
 
 test("transform preserves reference closure and measurement values", () => {
   const batch = validateBatch(validBody());
-  const manifest = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));
+  const manifest = transformBatch(batch, new Aliaser(SECRET), contentHash(batch), SECRET);
 
   const aliases = new Set(manifest.records.map((r) => r.recordAlias));
   for (const record of manifest.records) {
@@ -315,7 +315,7 @@ test("diagnostics below the cap report every exact path with no truncation", () 
 
 test("store: create / replay / conflict semantics, persisted to disk", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-store-"));
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   // Hashes use the real 64-hex shape: only contract-valid documents are ever persisted.
   const hash1 = "1".repeat(64);
   const hash2 = "2".repeat(64);
@@ -323,6 +323,7 @@ test("store: create / replay / conflict semantics, persisted to disk", async () 
     validateBatch(validBody()),
     new Aliaser(SECRET),
     hash1,
+    SECRET,
   );
 
   assert.equal((await store.create("batch-A", hash1, manifest)).status, "created");
@@ -331,7 +332,7 @@ test("store: create / replay / conflict semantics, persisted to disk", async () 
   assert.deepEqual(store.get("batch-A")?.contentHash, hash1);
 
   // A fresh store over the same directory restores manifests.
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, SECRET);
   await restarted.load();
   assert.equal(restarted.get("batch-A")?.contentHash, hash1);
   assert.equal((await restarted.create("batch-A", hash1, manifest)).status, "replayed");

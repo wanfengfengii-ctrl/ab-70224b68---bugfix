@@ -33,11 +33,37 @@ export interface SharedRecord {
   measurements: Record<string, MeasurementValue>;
 }
 
+/**
+ * Authenticity envelope embedded in every persisted shared manifest.
+ *
+ * The write path seals the document with the deployment key: `contentDigest`
+ * is the SHA-256 of the canonicalized full business payload (every protected
+ * field — aliases, related aliases, measurements, batchId, createdAt and the
+ * inbound contentHash), and `signature` is a keyed HMAC binding that digest to
+ * the batchId, file name and createdAt. Recovery recomputes both values, so a
+ * backup/storage modification that flips a protected field to another legal
+ * value (e.g. diagnosis "benign" -> "malignant") is detected even though the
+ * resulting JSON is structurally valid.
+ *
+ * The envelope is recovery metadata: it is verified at load time but never
+ * appears in a shared API response. The key never leaves the deployment, so an
+ * attacker who can rewrite files cannot forge a matching signature.
+ */
+export interface IntegrityEnvelope {
+  alg: "HS256";
+  version: 1;
+  /** SHA-256 (64 lowercase hex) of the canonicalized protected payload. */
+  contentDigest: string;
+  /** HMAC-SHA256 (64 lowercase hex) over the digest/batchId/file binding. */
+  signature: string;
+}
+
 export interface SharedManifest {
   batchId: string;
   createdAt: string;
   contentHash: string;
   records: SharedRecord[];
+  integrity: IntegrityEnvelope;
 }
 
 export interface ValidationIssue {

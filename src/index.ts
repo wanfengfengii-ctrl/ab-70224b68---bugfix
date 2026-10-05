@@ -5,7 +5,7 @@ import { ManifestStore } from "./store.ts";
 
 async function main(): Promise<void> {
   const config = await loadConfig();
-  const store = new ManifestStore(config.dataDir);
+  const store = new ManifestStore(config.dataDir, config.aliasSecret);
   await store.load();
 
   const server = createAppServer({

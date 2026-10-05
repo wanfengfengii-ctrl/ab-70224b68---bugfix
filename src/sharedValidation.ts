@@ -1,10 +1,12 @@
 import type {
+  IntegrityEnvelope,
   MeasurementValue,
   SharedManifest,
   SharedRecord,
 } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { IssueCollector } from "./diagnostics.ts";
+import { INTEGRITY_ALG, INTEGRITY_VERSION } from "./integrity.ts";
 import {
   BATCH_ID_PATTERN,
   FORBIDDEN_KEYS,
@@ -28,8 +30,11 @@ import {
  * served by GET nor silently overwritten.
  *
  * The contract enforced here mirrors exactly what the write path can produce:
- *  - the fixed field set {batchId, createdAt, contentHash, records}
+ *  - the fixed field set {batchId, createdAt, contentHash, records, integrity}
  *  - batchId charset, ISO-8601 UTC createdAt, 64-hex contentHash
+ *  - the integrity envelope field set, algorithm/version and hex shapes (the
+ *    envelope's cryptographic correctness is checked separately by
+ *    verifyManifestIntegrity with the deployment secret at load time)
  *  - per-category alias formats (pat-/acc-/rec- + 32 lowercase hex chars)
  *  - scalar measurement values under well-formed, non-reserved keys
  *  - recordAlias unique within the manifest
@@ -48,6 +53,62 @@ const CONTENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
 const RECORD_ALIAS_PATTERN = /^rec-[0-9a-f]{32}$/;
 const PATIENT_ALIAS_PATTERN = /^pat-[0-9a-f]{32}$/;
 const ACCESSION_ALIAS_PATTERN = /^acc-[0-9a-f]{32}$/;
+const INTEGRITY_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Structural check of the integrity envelope. Cryptographic correctness is
+ * intentionally NOT part of it: the deployment secret is unavailable to this
+ * pure validator. verifyManifestIntegrity performs the keyed check at load.
+ * Returns a normalized envelope or null (issues already recorded).
+ */
+function validateIntegrityEnvelope(raw: unknown, issues: IssueCollector): IntegrityEnvelope | null {
+  const path = "$.integrity";
+  if (!isPlainObject(raw)) {
+    issues.add("invalid_integrity_envelope", path, "integrity envelope must be a JSON object");
+    return null;
+  }
+
+  const allowedFields = new Set(["alg", "version", "contentDigest", "signature"]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedFields.has(key)) {
+      issues.add("integrity_unknown_field", `${path}.${key}`, "unexpected field in integrity envelope");
+    }
+  }
+
+  if (raw.alg !== INTEGRITY_ALG) {
+    issues.add("invalid_integrity_alg", `${path}.alg`, "unsupported integrity algorithm");
+  }
+  if (raw.version !== INTEGRITY_VERSION || typeof raw.version !== "number") {
+    issues.add("invalid_integrity_version", `${path}.version`, "unsupported integrity envelope version");
+  }
+  if (typeof raw.contentDigest !== "string" || !INTEGRITY_HEX_PATTERN.test(raw.contentDigest)) {
+    issues.add(
+      "invalid_integrity_digest",
+      `${path}.contentDigest`,
+      "contentDigest must be 64 lowercase hex characters",
+    );
+  }
+  if (typeof raw.signature !== "string" || !INTEGRITY_HEX_PATTERN.test(raw.signature)) {
+    issues.add(
+      "invalid_integrity_signature",
+      `${path}.signature`,
+      "signature must be 64 lowercase hex characters",
+    );
+  }
+
+  if (
+    typeof raw.contentDigest !== "string" ||
+    typeof raw.signature !== "string"
+  ) {
+    return null;
+  }
+  return {
+    alg: INTEGRITY_ALG,
+    version: INTEGRITY_VERSION,
+    contentDigest: raw.contentDigest,
+    signature: raw.signature,
+  };
+}
 
 function isValidCreatedAt(value: string): boolean {
   if (!CREATED_AT_PATTERN.test(value)) return false;
@@ -207,7 +268,7 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
     ]);
   }
 
-  const topAllowed = new Set(["batchId", "createdAt", "contentHash", "records"]);
+  const topAllowed = new Set(["batchId", "createdAt", "contentHash", "records", "integrity"]);
   for (const key of Object.keys(raw)) {
     if (!topAllowed.has(key)) {
       issues.add("manifest_unknown_field", `$.${key}`, "unexpected top-level field");
@@ -240,6 +301,9 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
       "contentHash must be 64 lowercase hex characters",
     );
   }
+
+  let integrity: IntegrityEnvelope | null = null;
+  integrity = validateIntegrityEnvelope(raw.integrity, issues);
 
   const records: SharedRecord[] = [];
   if (!Array.isArray(raw.records) || raw.records.length === 0) {
@@ -285,5 +349,6 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
     createdAt: raw.createdAt as string,
     contentHash: raw.contentHash as string,
     records,
+    integrity: integrity as IntegrityEnvelope,
   };
 }

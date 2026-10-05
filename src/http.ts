@@ -5,6 +5,7 @@ import { transformBatch } from "./transform.ts";
 import { BATCH_ID_PATTERN, validateBatch } from "./validation.ts";
 import { log } from "./log.ts";
 import { ManifestStore } from "./store.ts";
+import type { SharedManifest } from "./types.ts";
 import {
   BatchConflictError,
   ValidationFailed,
@@ -26,6 +27,20 @@ export interface ServerDeps {
   store: ManifestStore;
   aliasSecret: Buffer;
   maxBodyBytes: number;
+}
+
+/**
+ * Project a persisted manifest onto the public, shareable response shape.
+ * The integrity envelope is recovery metadata and must never appear in a
+ * shared API response.
+ */
+function toPublicView(manifest: SharedManifest): Omit<SharedManifest, "integrity"> {
+  return {
+    batchId: manifest.batchId,
+    createdAt: manifest.createdAt,
+    contentHash: manifest.contentHash,
+    records: manifest.records,
+  };
 }
 
 export function createAppServer(deps: ServerDeps) {
@@ -81,15 +96,16 @@ export function createAppServer(deps: ServerDeps) {
     const hash = contentHash(batch);
 
     // The aliaser is request scoped; the deployment secret is what makes
-    // aliases consistent across batches.
-    const manifest = transformBatch(batch, new Aliaser(aliasSecret), hash);
+    // aliases consistent across batches — and what seals the persisted
+    // integrity envelope checked on recovery.
+    const manifest = transformBatch(batch, new Aliaser(aliasSecret), hash, aliasSecret);
 
     const outcome = await store.create(batch.batchId, hash, manifest);
     if (outcome.status === "conflict") {
       throw new BatchConflictError(batch.batchId);
     }
     // On replay the stored document (original createdAt included) is returned.
-    const result = outcome.manifest;
+    const result = toPublicView(outcome.manifest);
     log.info("manifest_accepted", {
       batchId: batch.batchId,
       records: result.records.length,
@@ -106,7 +122,7 @@ export function createAppServer(deps: ServerDeps) {
     if (manifest === undefined) {
       throw new HttpError(404, "manifest_not_found", "no manifest exists for this batchId");
     }
-    sendJson(res, 200, manifest);
+    sendJson(res, 200, toPublicView(manifest));
   }
 
   const server = createServer(async (req: any, res: any) => {

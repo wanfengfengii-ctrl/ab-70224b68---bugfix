@@ -38,7 +38,7 @@ let server: any;
 
 before(async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-api-"));
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await store.load();
   server = createAppServer({ store, aliasSecret: SECRET, maxBodyBytes: 1_000_000 });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

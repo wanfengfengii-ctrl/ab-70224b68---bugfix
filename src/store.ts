@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { IssueTruncation, SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { validateSharedManifest } from "./sharedValidation.ts";
+import { verifyManifestIntegrity } from "./integrity.ts";
 import { log } from "./log.ts";
 
 /**
@@ -20,11 +21,17 @@ import { log } from "./log.ts";
  * persisted entry is re-validated against the full current shared-manifest
  * contract (structure, alias/hash/timestamp formats, scalar measurements,
  * record-alias uniqueness, reference closure and the file-name <-> batchId
- * binding) before it is trusted. Any corrupt entry is reported via
- * diagnostics that contain only the hashed file name, rule codes and JSON
- * paths — never file contents — and aborts startup. A corrupt entry is
- * therefore never served by GET and never treated as absent, so a batchId
- * with a corrupt entry cannot be silently overwritten either.
+ * binding) AND its integrity envelope is recomputed and verified with the
+ * deployment secret. The structural contract catches malformed documents;
+ * the envelope catches a protected field that was rewritten at the
+ * persistence layer to another legal value (e.g. diagnosis "benign" ->
+ * "malignant" while the original contentHash is left untouched), which no
+ * schema check could distinguish from the document first accepted. Any
+ * corrupt entry is reported via diagnostics that contain only the hashed
+ * file name, rule codes and JSON paths — never file contents — and aborts
+ * startup. A corrupt entry is therefore never served by GET and never
+ * treated as absent, so a batchId with a corrupt entry cannot be silently
+ * overwritten either.
  */
 
 export type CreateOutcome =
@@ -55,9 +62,16 @@ export class ManifestStore {
   private readonly locks = new Map<string, Promise<unknown>>();
 
   private readonly dataDir: string;
+  /**
+   * Deployment secret used to verify persisted integrity envelopes. It is the
+   * same key that mints aliases, so an actor who can rewrite storage but does
+   * not hold the key cannot forge an envelope for tampered content.
+   */
+  private readonly secret: Buffer;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, secret: Buffer) {
     this.dataDir = dataDir;
+    this.secret = secret;
     mkdirSync(dataDir, { recursive: true });
   }
 
@@ -152,6 +166,16 @@ export class ManifestStore {
         "$.batchId",
         "batchId does not match the persisted file name binding",
       );
+    }
+
+    // Structural validity is not enough on its own: a backup restore or
+    // storage-layer write can flip a protected field to another legal value
+    // while keeping every format valid. Recompute the deployment-key-bound
+    // envelope and reject anything that does not authenticate byte-for-byte
+    // against what the service first accepted.
+    const integrity = verifyManifestIntegrity(manifest, this.secret);
+    if (!integrity.ok) {
+      return readIssue(integrity.code, integrity.path, integrity.message);
     }
 
     this.manifests.set(manifest.batchId, manifest);

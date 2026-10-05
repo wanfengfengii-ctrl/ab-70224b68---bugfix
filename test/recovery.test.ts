@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { Aliaser } from "../src/alias.ts";
 import { contentHash } from "../src/canonical.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
+import { canonicalDigestOf, verifyManifestIntegrity } from "../src/integrity.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 import { transformBatch } from "../src/transform.ts";
@@ -71,12 +72,12 @@ test("recovery: a valid persisted manifest survives a restart", async () => {
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-ok-"));
   const batch = validateBatch(validBody("batch-restore-ok"));
   const hash = contentHash(batch);
-  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, SECRET);
 
-  const first = new ManifestStore(dir);
+  const first = new ManifestStore(dir, SECRET);
   assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, SECRET);
   await restarted.load();
   assert.deepEqual(restarted.get("batch-restore-ok"), manifest);
   // Idempotency/conflict semantics are intact over restored entries.
@@ -90,12 +91,12 @@ test("recovery: the corrupt restore-batch sample aborts startup and is never ser
   // A fully valid entry sits next to the corrupt one.
   const batch = validateBatch(validBody("batch-healthy"));
   const hash = contentHash(batch);
-  const first = new ManifestStore(dir);
-  await first.create(batch.batchId, hash, transformBatch(batch, new Aliaser(SECRET), hash));
+  const first = new ManifestStore(dir, SECRET);
+  await first.create(batch.batchId, hash, transformBatch(batch, new Aliaser(SECRET), hash, SECRET));
 
   await writeEntry(dir, fileNameFor("restore-batch"), CORRUPT_SAMPLE);
 
-  const restarted = new ManifestStore(dir);
+  const restarted = new ManifestStore(dir, SECRET);
   let failure: unknown;
   try {
     await restarted.load();
@@ -143,7 +144,7 @@ test("recovery: duplicate record aliases in a persisted entry are rejected", asy
     records: [record, { ...record }],
   });
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dup-alias"), undefined);
 });
@@ -165,7 +166,7 @@ test("recovery: unclosed references in a persisted entry are rejected", async ()
     ],
   });
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-dangling-alias"), undefined);
 });
@@ -174,11 +175,11 @@ test("recovery: file name must match the SHA-256 binding of its batchId", async 
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-binding-"));
   const batch = validateBatch(validBody("batch-binding"));
   const hash = contentHash(batch);
-  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, SECRET);
   // Persist the valid document under the WRONG file name.
   await writeEntry(dir, fileNameFor("some-other-batch"), manifest);
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-binding"), undefined);
 });
@@ -194,6 +195,15 @@ test("recovery: a restored entry with a thousand invalid values yields bounded d
     batchId: "batch-many-bad",
     createdAt: "2026-10-04T00:00:00.000Z",
     contentHash: "0".repeat(64),
+    // Structurally well-formed envelope so the 1000 measurement violations are
+    // exactly what is counted; cryptographic verification is moot because the
+    // structural violations already reject the entry.
+    integrity: {
+      alg: "HS256",
+      version: 1,
+      contentDigest: "0".repeat(64),
+      signature: "0".repeat(64),
+    },
     records: [
       {
         recordAlias: `rec-${"a".repeat(32)}`,
@@ -232,7 +242,7 @@ test("recovery: a restored entry with a thousand invalid values yields bounded d
     captured.push(String(chunk));
     return true;
   };
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   let failure: unknown;
   try {
     await store.load();
@@ -261,13 +271,149 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
   const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-json-"));
   await writeEntry(dir, fileNameFor("batch-broken"), "{not valid json");
 
-  const store = new ManifestStore(dir);
+  const store = new ManifestStore(dir, SECRET);
   await assert.rejects(store.load(), CorruptStoreError);
+});
+
+/**
+ * The regression behind the integrity envelope: a backup that was restored
+ * after partial corruption, or an equivalent persistence-layer write, flips a
+ * protected business field to another LEGAL value. batchId, file name, alias
+ * formats, createdAt and the original contentHash all stay valid — only the
+ * measurement scalar changes ("benign" -> "malignant"). Structural recovery
+ * validation alone would accept it; the deployment-key envelope must not.
+ */
+test("recovery: a legal-scalar rewrite of a protected field aborts startup and is never served or replayed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-tamper-"));
+  const batch = validateBatch({
+    batchId: "integrity-case",
+    records: [
+      {
+        recordId: "R1",
+        patientId: "P1",
+        accessionId: "A1",
+        relatedIds: [],
+        measurements: { diagnosis: "benign" },
+      },
+    ],
+  });
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, SECRET);
+
+  const first = new ManifestStore(dir, SECRET);
+  assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
+
+  // Storage-layer modification: same file name, same batchId/createdAt/hash,
+  // only the protected measurement value flips to another legal scalar.
+  const tampered = JSON.parse(JSON.stringify(manifest)) as typeof manifest;
+  tampered.records[0].measurements.diagnosis = "malignant";
+  await writeEntry(dir, fileNameFor("integrity-case"), tampered);
+
+  const restarted = new ManifestStore(dir, SECRET);
+  let failure: unknown;
+  try {
+    await restarted.load();
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure instanceof CorruptStoreError, "the tampered entry must abort the load");
+  assert.deepEqual((failure as InstanceType<typeof CorruptStoreError>).files, [
+    fileNameFor("integrity-case"),
+  ]);
+
+  // Never queryable, and cannot be made to participate in an idempotent
+  // replay (which would return the rewritten document with HTTP 200).
+  assert.equal(restarted.get("integrity-case"), undefined);
+
+  // The structural contract itself is happy with the tampered document: the
+  // envelope is what rejects it, with a dedicated rule code and a path that
+  // never carries the (attacker-controlled) rewritten value.
+  const structurallyValid = validateSharedManifest(JSON.parse(JSON.stringify(tampered)));
+  assert.equal(structurallyValid.records[0].measurements.diagnosis, "malignant");
+  const check = verifyManifestIntegrity(structurallyValid, SECRET);
+  assert.equal(check.ok, false);
+  if (check.ok) throw new Error("unreachable");
+  assert.equal(check.code, "content_digest_mismatch");
+  assert.match(check.path, /^\$\.integrity(\.|$)/);
+  assert.ok(!JSON.stringify(check).includes("malignant"));
+});
+
+test("recovery: a recomputed digest without the deployment key still fails the signature", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-resign-"));
+  const batch = validateBatch({
+    batchId: "integrity-resign-case",
+    records: [
+      { recordId: "R1", patientId: "P1", accessionId: "A1", relatedIds: [], measurements: { diagnosis: "benign" } },
+    ],
+  });
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, SECRET);
+
+  // Attacker rewrites the value and recomputes the (keyless) content digest,
+  // but cannot forge the keyed signature.
+  const tampered = JSON.parse(JSON.stringify(manifest)) as typeof manifest;
+  tampered.records[0].measurements.diagnosis = "malignant";
+  tampered.integrity.contentDigest = canonicalDigestOf(tampered);
+  await writeEntry(dir, fileNameFor("integrity-resign-case"), tampered);
+
+  const store = new ManifestStore(dir, SECRET);
+  await assert.rejects(store.load(), CorruptStoreError);
+  assert.equal(store.get("integrity-resign-case"), undefined);
+
+  const check = verifyManifestIntegrity(validateSharedManifest(JSON.parse(JSON.stringify(tampered))), SECRET);
+  assert.equal(check.ok, false);
+  if (!check.ok) assert.equal(check.code, "integrity_signature_mismatch");
+});
+
+test("recovery: entries sealed with another deployment secret are rejected", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-secret-"));
+  const otherSecret = Buffer.from("fedcba9876543210fedcba9876543210", "utf8");
+  const batch = validateBatch({
+    batchId: "integrity-secret-case",
+    records: [
+      { recordId: "R1", patientId: "P1", accessionId: "A1", relatedIds: [], measurements: { diagnosis: "benign" } },
+    ],
+  });
+  const hash = contentHash(batch);
+  const sealedElsewhere = transformBatch(batch, new Aliaser(otherSecret), hash, otherSecret);
+  await writeEntry(dir, fileNameFor("integrity-secret-case"), sealedElsewhere);
+
+  const store = new ManifestStore(dir, SECRET);
+  await assert.rejects(store.load(), CorruptStoreError);
+  assert.equal(store.get("integrity-secret-case"), undefined);
+});
+
+test("recovery: a missing or malformed integrity envelope is rejected", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-noenvelope-"));
+  const batch = validateBatch({
+    batchId: "integrity-missing-case",
+    records: [
+      { recordId: "R1", patientId: "P1", accessionId: "A1", relatedIds: [], measurements: { diagnosis: "benign" } },
+    ],
+  });
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash, SECRET);
+
+  for (const mutate of [
+    (m: any) => delete m.integrity,
+    (m: any) => (m.integrity = null),
+    (m: any) => (m.integrity = {}),
+    (m: any) => (m.integrity.version = 2),
+    (m: any) => (m.integrity.contentHash = m.integrity.contentDigest),
+    (m: any) => (m.integrity.signature = "z".repeat(64)),
+  ]) {
+    const entry = JSON.parse(JSON.stringify(manifest));
+    mutate(entry);
+    await writeEntry(dir, fileNameFor("integrity-missing-case"), entry);
+    const store = new ManifestStore(dir, SECRET);
+    await assert.rejects(store.load(), CorruptStoreError);
+    assert.equal(store.get("integrity-missing-case"), undefined);
+  }
 });
 
 test("shared manifest contract: field set, formats and scalar measurements", () => {
   const batch = validateBatch(validBody("batch-contract"));
-  const good = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));
+  const good = transformBatch(batch, new Aliaser(SECRET), contentHash(batch), SECRET);
   // A manifest produced by the write path always satisfies the contract.
   assert.deepEqual(validateSharedManifest(JSON.parse(JSON.stringify(good))), good);
 

@@ -10,6 +10,7 @@ import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
+import { canonicalDigestOf, verifyManifestIntegrity } from "../src/integrity.ts";
 import { CorruptManifestError } from "../src/types.ts";
 import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 
@@ -125,6 +126,12 @@ async function runSmoke(): Promise<boolean> {
     const created = await postJson("/api/manifests", batchOne);
     assert(created.status === 201, `expected 201, got ${created.status}`);
     assertNoRawLeak("create response", created.json);
+    assert(
+      created.json.integrity === undefined &&
+        !JSON.stringify(created.json).includes("contentDigest") &&
+        !JSON.stringify(created.json).includes("signature"),
+      "integrity metadata must never appear in a shared API response",
+    );
     const createdText = JSON.stringify(created.json);
     for (const prefix of ["rec-", "pat-", "acc-"]) {
       assert(createdText.includes(prefix), `create response missing ${prefix} aliases`);
@@ -289,6 +296,12 @@ async function runSmoke(): Promise<boolean> {
  *   - a valid persisted manifest is queryable after a restart
  *   - the confirmed corrupt restore-batch sample aborts the load, is never
  *     served, and its raw identifiers never appear in diagnostics
+ *   - a LEGAL-SCALAR rewrite at the persistence layer (the integrity-case
+ *     diagnosis benign -> malignant, with batchId, file name, alias format,
+ *     createdAt and the original contentHash all untouched) aborts the load:
+ *     the entry is neither queryable nor eligible for idempotent replay
+ *   - recomputing the keyless digest without the deployment secret still
+ *     fails the keyed signature
  *   - duplicate record aliases and unclosed references are rejected
  *   - a restored entry with a thousand invalid values aborts the load with
  *     bounded, truncated diagnostics (capped issue list + remaining count
@@ -302,7 +315,7 @@ async function runRecoverySmoke(): Promise<boolean> {
   const secret = Buffer.from("verify-recovery-secret-0123456789ab", "utf8");
 
   const expectCorruptLoad = async (dir: string, batchId: string): Promise<Error> => {
-    const store = new ManifestStore(dir);
+    const store = new ManifestStore(dir, secret);
     try {
       await store.load();
     } catch (err) {
@@ -332,10 +345,10 @@ async function runRecoverySmoke(): Promise<boolean> {
       ],
     });
     const hash = contentHash(batch);
-    const manifest = transformBatch(batch, new Aliaser(secret), hash);
-    const first = new ManifestStore(okDir);
+    const manifest = transformBatch(batch, new Aliaser(secret), hash, secret);
+    const first = new ManifestStore(okDir, secret);
     assert((await first.create(batch.batchId, hash, manifest)).status === "created", "create failed");
-    const restored = new ManifestStore(okDir);
+    const restored = new ManifestStore(okDir, secret);
     await restored.load();
     assert(
       JSON.stringify(restored.get(batch.batchId)) === JSON.stringify(manifest),
@@ -371,6 +384,75 @@ async function runRecoverySmoke(): Promise<boolean> {
     for (const raw of RECOVERY_RAW_IDS) {
       assert(!failure.message.includes(raw), `diagnostics must not contain raw identifier ${raw}`);
     }
+
+    // 2b. THE INTEGRITY REGRESSION: a backup/storage modification flips a
+    // protected field to another LEGAL scalar (diagnosis benign -> malignant)
+    // while batchId, file name, alias formats, createdAt and the original
+    // contentHash all stay unchanged. Structural validation accepts that
+    // document; the deployment-key envelope must reject it, and the entry
+    // must be neither queryable nor eligible for idempotent replay.
+    const tamperDir = mkdtempSync(join(tmpdir(), "verify-recovery-tamper-"));
+    const tamperBatch = validateBatch({
+      batchId: "integrity-case",
+      records: [
+        {
+          recordId: "R1",
+          patientId: "P1",
+          accessionId: "A1",
+          relatedIds: [],
+          measurements: { diagnosis: "benign" },
+        },
+      ],
+    });
+    const tamperHash = contentHash(tamperBatch);
+    const sealed = transformBatch(tamperBatch, new Aliaser(secret), tamperHash, secret);
+    const sealing = new ManifestStore(tamperDir, secret);
+    assert((await sealing.create(tamperBatch.batchId, tamperHash, sealed)).status === "created", "create failed");
+    const tampered = JSON.parse(JSON.stringify(sealed));
+    tampered.records[0].measurements.diagnosis = "malignant";
+    // Everything but the measurement is kept byte-identical: same batchId,
+    // same file-name binding, same createdAt and same original contentHash.
+    assert(tampered.batchId === "integrity-case", "batchId must remain unchanged");
+    assert(tampered.createdAt === sealed.createdAt, "createdAt must remain unchanged");
+    assert(tampered.contentHash === tamperHash, "the original contentHash must remain unchanged");
+    await writeFile(join(tamperDir, fileNameFor("integrity-case")), JSON.stringify(tampered));
+    const tamperedStore = new ManifestStore(tamperDir, secret);
+    await expectCorruptLoad(tamperDir, "integrity-case");
+
+    // The rewritten value must not surface via GET and the ORIGINAL request
+    // can never be downgraded into a 200 "replay" of the rewritten document:
+    // after the failed load the batchId is simply absent from the index.
+    assert(tamperedStore.get("integrity-case") === undefined, "tampered entry must never be queryable");
+    const replayed = transformBatch(tamperBatch, new Aliaser(secret), tamperHash, secret);
+    assert(
+      JSON.stringify(replayed.records[0].measurements) === JSON.stringify({ diagnosis: "benign" }),
+      "the originally accepted content remains benign",
+    );
+
+    // The tampered document is structurally contract-valid on its own: prove
+    // the envelope check — not a schema rule — is what rejects it, and that
+    // its diagnostic never carries the rewritten value.
+    const structurallyOk = validateSharedManifest(JSON.parse(JSON.stringify(tampered)));
+    assert(
+      structurallyOk.records[0].measurements.diagnosis === "malignant",
+      "structural validation alone would accept the legal rewrite",
+    );
+    const check = verifyManifestIntegrity(structurallyOk, secret);
+    assert(check.ok === false, "the integrity envelope must reject the legal rewrite");
+    assert(
+      !JSON.stringify(check).includes("malignant"),
+      "integrity diagnostics must not echo the rewritten value",
+    );
+
+    // 2c. Recomputing the keyless digest still fails the keyed signature: an
+    // attacker without the deployment secret cannot re-seal tampered content.
+    const resignDir = mkdtempSync(join(tmpdir(), "verify-recovery-resign-"));
+    const resigned = JSON.parse(JSON.stringify(sealed));
+    resigned.batchId = "integrity-case";
+    resigned.records[0].measurements.diagnosis = "malignant";
+    resigned.integrity.contentDigest = canonicalDigestOf(resigned);
+    await writeFile(join(resignDir, fileNameFor("integrity-case")), JSON.stringify(resigned));
+    await expectCorruptLoad(resignDir, "integrity-case");
 
     // 3. Duplicate record aliases in a restored entry are rejected.
     const dupDir = mkdtempSync(join(tmpdir(), "verify-recovery-dup-"));
@@ -417,6 +499,14 @@ async function runRecoverySmoke(): Promise<boolean> {
       batchId: "verify-recovery-many",
       createdAt: "2026-10-04T00:00:00.000Z",
       contentHash: "0".repeat(64),
+      // Structurally well-formed envelope: keeps the counted issue set exactly
+      // the 1000 measurement violations (crypto never runs for this entry).
+      integrity: {
+        alg: "HS256",
+        version: 1,
+        contentDigest: "0".repeat(64),
+        signature: "0".repeat(64),
+      },
       records: [{ ...dupRecord, measurements: manyMeasurements }],
     };
     let contractErr: unknown;
